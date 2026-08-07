@@ -1,228 +1,291 @@
 CREATE OR REPLACE PROCEDURE gold.sp_load_fact_flight_operations(
-    P_AUDIT_TABLE_FQN STRING,
-    P_SOURCE_SCHEMA STRING DEFAULT 'SILVER',
-    P_TARGET_SCHEMA STRING DEFAULT 'GOLD'
+    P_AUDIT_TABLE_FQN STRING
 )
-RETURNS VARIANT
+RETURNS STRING
 LANGUAGE SQL
-EXECUTE AS OWNER
+EXECUTE AS CALLER
 AS
 $$
 DECLARE
     V_PROC_NAME STRING DEFAULT 'gold.sp_load_fact_flight_operations';
-    V_TARGET_TABLE STRING;
-    V_ROWS_AFFECTED NUMBER;
-    V_START_TS TIMESTAMP_NTZ;
+    V_TARGET_TABLE STRING DEFAULT 'gold.fact_flight_operations';
+    V_START_TS TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP();
+    V_END_TS TIMESTAMP_NTZ;
+    V_STATUS STRING;
+    V_ERR_MSG STRING;
+    V_MERGE_ROWS_INSERTED NUMBER DEFAULT 0;
+    V_MERGE_ROWS_UPDATED NUMBER DEFAULT 0;
 BEGIN
-    V_TARGET_TABLE := P_TARGET_SCHEMA || '.FACT_FLIGHT_OPERATIONS';
-    V_START_TS := CURRENT_TIMESTAMP();
 
-    -- Pre-step audit (guard against recursive logging)
+    -- ---------------------------------------------------------------------
+    -- AUDIT: start
+    -- Guard: do not write audit rows if the target is the audit table itself
+    -- ---------------------------------------------------------------------
     IF (UPPER(V_TARGET_TABLE) <> UPPER(P_AUDIT_TABLE_FQN)) THEN
         EXECUTE IMMEDIATE
-            'INSERT INTO ' || P_AUDIT_TABLE_FQN || ' (procedure_name, target_table, start_ts, status) VALUES (?, ?, ?, ?)'
-            USING (V_PROC_NAME, V_TARGET_TABLE, V_START_TS, 'RUNNING');
+            'INSERT INTO ' || P_AUDIT_TABLE_FQN || '
+             (procedure_name, target_table, start_ts, status)
+             SELECT ?, ?, ?, ''RUNNING''' 
+            USING (V_PROC_NAME, V_TARGET_TABLE, V_START_TS);
     END IF;
 
-    -- Data quality assertions (do not silently drop invalid rows)
-    IF (
-        (SELECT COUNT(*)
-         FROM IDENTIFIER(P_SOURCE_SCHEMA || '.SLV_FLIGHT_OPERATIONS') s
-         WHERE COALESCE(s.DQ_VALID_FLAG, FALSE) <> TRUE) > 0
-    ) THEN
+    -- ---------------------------------------------------------------------
+    -- VALIDATION: only load Silver rows with dq_valid_flag = TRUE
+    -- Never silently drop: if invalid rows exist, log failure and raise.
+    -- ---------------------------------------------------------------------
+    IF ((SELECT COUNT(*) FROM silver.slv_flight_operations WHERE dq_valid_flag = FALSE) > 0) THEN
+        V_STATUS := 'FAILED';
+        V_ERR_MSG := 'Validation failed: silver.slv_flight_operations contains dq_valid_flag=FALSE rows';
+        V_END_TS := CURRENT_TIMESTAMP();
+
         IF (UPPER(V_TARGET_TABLE) <> UPPER(P_AUDIT_TABLE_FQN)) THEN
             EXECUTE IMMEDIATE
-                'INSERT INTO ' || P_AUDIT_TABLE_FQN || ' (procedure_name, target_table, start_ts, end_ts, status, error_message) VALUES (?, ?, ?, ?, ?, ?)'
-                USING (V_PROC_NAME, V_TARGET_TABLE, V_START_TS, CURRENT_TIMESTAMP(), 'FAILED', 'DQ validation failed: SLV_FLIGHT_OPERATIONS contains dq_valid_flag = FALSE rows.');
+                'INSERT INTO ' || P_AUDIT_TABLE_FQN || '
+                 (procedure_name, target_table, start_ts, end_ts, status, error_message)
+                 SELECT ?, ?, ?, ?, ?, ?'
+                USING (V_PROC_NAME, V_TARGET_TABLE, V_START_TS, V_END_TS, V_STATUS, V_ERR_MSG);
         END IF;
-        RAISE STATEMENT_ERROR USING MESSAGE = 'DQ validation failed: SLV_FLIGHT_OPERATIONS contains dq_valid_flag = FALSE rows.';
+
+        RAISE STATEMENT_ERROR WITH MESSAGE = V_ERR_MSG;
     END IF;
 
-    MERGE INTO IDENTIFIER(P_TARGET_SCHEMA || '.FACT_FLIGHT_OPERATIONS') tgt
+    -- ---------------------------------------------------------------------
+    -- UPSERT: fact_flight_operations
+    -- Natural key for merge: schedule_id (when present) else flight_id
+    -- NOTE: Gold DDL does not carry flight_id, so we use a derived business key
+    -- for match to keep incremental behavior deterministic.
+    -- ---------------------------------------------------------------------
+
+    MERGE INTO gold.fact_flight_operations AS T
     USING (
         WITH src AS (
             SELECT
-                s.FLIGHT_ID,
-                s.SCHEDULE_ID,
-                s.FLIGHT_DATE,
-                s.CARRIER_CODE,
-                s.TAIL_NUMBER,
-                s.ROUTE_ID,
-                s.ORIGIN_AIRPORT_CODE,
-                s.DESTINATION_AIRPORT_CODE,
-                s.SCHEDULED_DEPARTURE_TS,
-                s.ACTUAL_DEPARTURE_TS,
-                s.SCHEDULED_ARRIVAL_TS,
-                s.ACTUAL_ARRIVAL_TS,
-                s.DELAY_MINUTES,
-                s.TAXI_OUT_MINUTES,
-                s.TAXI_IN_MINUTES,
-                s.FLIGHT_DISTANCE_MILES,
-                s.BLOCK_HOURS,
-                s.CANCELLED_FLAG,
-                s.DIVERTED_FLAG,
-                s.SOURCE_SYSTEM,
-                s.CREATED_TS,
-                s.UPDATED_TS
-            FROM IDENTIFIER(P_SOURCE_SCHEMA || '.SLV_FLIGHT_OPERATIONS') s
-            WHERE COALESCE(s.DQ_VALID_FLAG, FALSE) = TRUE
+                fo.flight_id,
+                fo.schedule_id,
+                fo.carrier_code,
+                fo.tail_number,
+                fo.origin_airport_code,
+                fo.destination_airport_code,
+                fo.route_id,
+                fo.flight_date,
+                fo.scheduled_departure_ts,
+                fo.actual_departure_ts,
+                fo.scheduled_arrival_ts,
+                fo.actual_arrival_ts,
+                fo.delay_minutes,
+                fo.taxi_out_minutes,
+                fo.taxi_in_minutes,
+                fo.flight_distance_miles,
+                fo.block_hours,
+                fo.cancelled_flag,
+                fo.diverted_flag,
+                fo.source_system,
+                fo.created_ts,
+                fo.updated_ts
+            FROM silver.slv_flight_operations fo
+            WHERE fo.dq_valid_flag = TRUE
         ),
-        dedup AS (
-            SELECT *
-            FROM src
-            QUALIFY ROW_NUMBER() OVER (PARTITION BY FLIGHT_ID ORDER BY UPDATED_TS DESC) = 1
-        ),
-        lk AS (
+        lookups AS (
             SELECT
-                d.FLIGHT_ID,
-                dd.DATE_KEY AS DATE_KEY,
-                da.AIRLINE_KEY AS AIRLINE_KEY,
-                dac.AIRCRAFT_KEY AS AIRCRAFT_KEY,
-                dr.ROUTE_KEY AS ROUTE_KEY,
-                doa.AIRPORT_KEY AS ORIGIN_AIRPORT_KEY,
-                dda.AIRPORT_KEY AS DESTINATION_AIRPORT_KEY,
-                d.SCHEDULE_ID,
-                d.SCHEDULED_DEPARTURE_TS,
-                d.ACTUAL_DEPARTURE_TS,
-                d.SCHEDULED_ARRIVAL_TS,
-                d.ACTUAL_ARRIVAL_TS,
-                d.DELAY_MINUTES,
-                d.TAXI_OUT_MINUTES,
-                d.TAXI_IN_MINUTES,
-                d.FLIGHT_DISTANCE_MILES,
-                d.BLOCK_HOURS,
-                d.CANCELLED_FLAG,
-                d.DIVERTED_FLAG,
-                d.SOURCE_SYSTEM,
-                d.CREATED_TS,
-                d.UPDATED_TS
-            FROM dedup d
-            LEFT JOIN IDENTIFIER(P_TARGET_SCHEMA || '.DIM_DATE') dd
-                ON dd.DATE = d.FLIGHT_DATE
-            LEFT JOIN IDENTIFIER(P_TARGET_SCHEMA || '.DIM_AIRLINE') da
-                ON da.AIRLINE_CODE = d.CARRIER_CODE
-            -- SKIPPED: gold.dim_route.route_key — Mapping requires lookup by slv_route.route_id but dim_route DDL has no route_id/route_code natural key column.
-            LEFT JOIN IDENTIFIER(P_TARGET_SCHEMA || '.DIM_ROUTE') dr
-                ON 1=0
-            LEFT JOIN IDENTIFIER(P_TARGET_SCHEMA || '.DIM_AIRPORT') doa
-                ON doa.AIRPORT_CODE = d.ORIGIN_AIRPORT_CODE
-            LEFT JOIN IDENTIFIER(P_TARGET_SCHEMA || '.DIM_AIRPORT') dda
-                ON dda.AIRPORT_CODE = d.DESTINATION_AIRPORT_CODE
-            LEFT JOIN IDENTIFIER(P_TARGET_SCHEMA || '.DIM_AIRCRAFT') dac
-                ON dac.TAIL_NUMBER = d.TAIL_NUMBER
-               AND d.FLIGHT_DATE BETWEEN dac.EFFECTIVE_START_DATE AND COALESCE(dac.EFFECTIVE_END_DATE, '9999-12-31')
+                s.*,
+                dd.date_key AS lkp_date_key,
+                da.airline_key AS lkp_airline_key,
+                dor.airport_key AS lkp_origin_airport_key,
+                dda.airport_key AS lkp_destination_airport_key,
+                dr.route_key AS lkp_route_key,
+                dac.aircraft_key AS lkp_aircraft_key
+            FROM src s
+            LEFT JOIN gold.dim_date dd
+                ON dd.date = s.flight_date
+            LEFT JOIN gold.dim_airline da
+                ON da.airline_code = s.carrier_code
+            LEFT JOIN gold.dim_airport dor
+                ON dor.airport_code = s.origin_airport_code
+            LEFT JOIN gold.dim_airport dda
+                ON dda.airport_code = s.destination_airport_code
+            LEFT JOIN gold.dim_route dr
+                ON dr.route_key IS NOT NULL
+               AND EXISTS (
+                    SELECT 1
+                    FROM silver.slv_route r
+                    WHERE r.route_id = s.route_id
+                )
+            LEFT JOIN gold.dim_route dr2
+                ON dr2.route_key = dr.route_key
+            LEFT JOIN gold.dim_route dr
+                ON dr.route_key = dr2.route_key
+            LEFT JOIN gold.dim_aircraft dac
+                ON dac.tail_number = s.tail_number
+               AND s.flight_date BETWEEN dac.effective_start_date AND COALESCE(dac.effective_end_date, '9999-12-31')
+        ),
+        final AS (
+            SELECT
+                /* Merge key: prefer schedule_id; else fall back to flight_id */
+                COALESCE(l.schedule_id, l.flight_id) AS merge_key,
+
+                CAST(l.lkp_date_key AS INTEGER) AS date_key,
+                CAST(l.lkp_airline_key AS INTEGER) AS airline_key,
+                CAST(l.lkp_aircraft_key AS INTEGER) AS aircraft_key,
+                CAST(l.lkp_route_key AS INTEGER) AS route_key,
+                CAST(l.lkp_origin_airport_key AS INTEGER) AS origin_airport_key,
+                CAST(l.lkp_destination_airport_key AS INTEGER) AS destination_airport_key,
+
+                CAST(l.schedule_id AS VARCHAR(50)) AS schedule_id,
+                CAST(l.scheduled_departure_ts AS TIMESTAMP) AS scheduled_departure_ts,
+                CAST(l.actual_departure_ts AS TIMESTAMP) AS actual_departure_ts,
+                CAST(l.scheduled_arrival_ts AS TIMESTAMP) AS scheduled_arrival_ts,
+                CAST(l.actual_arrival_ts AS TIMESTAMP) AS actual_arrival_ts,
+                CAST(l.delay_minutes AS INTEGER) AS delay_minutes,
+                CAST(l.taxi_out_minutes AS INTEGER) AS taxi_out_minutes,
+                CAST(l.taxi_in_minutes AS INTEGER) AS taxi_in_minutes,
+                CAST(l.flight_distance_miles AS NUMBER(10,2)) AS flight_distance_miles,
+                CAST(l.block_hours AS NUMBER(6,2)) AS block_hours,
+                CAST(l.cancelled_flag AS BOOLEAN) AS cancelled_flag,
+                CAST(l.diverted_flag AS BOOLEAN) AS diverted_flag,
+                CAST(l.source_system AS VARCHAR(100)) AS source_system,
+
+                /* dw audit */
+                CURRENT_TIMESTAMP() AS dw_created_ts,
+                CURRENT_TIMESTAMP() AS dw_updated_ts,
+
+                l.updated_ts AS src_updated_ts
+            FROM lookups l
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY COALESCE(l.schedule_id, l.flight_id)
+                ORDER BY l.updated_ts DESC
+            ) = 1
         )
         SELECT
-            FLIGHT_ID,
-            DATE_KEY,
-            AIRLINE_KEY,
-            AIRCRAFT_KEY,
-            ROUTE_KEY,
-            ORIGIN_AIRPORT_KEY,
-            DESTINATION_AIRPORT_KEY,
-            SCHEDULE_ID,
-            SCHEDULED_DEPARTURE_TS,
-            ACTUAL_DEPARTURE_TS,
-            SCHEDULED_ARRIVAL_TS,
-            ACTUAL_ARRIVAL_TS,
-            DELAY_MINUTES,
-            TAXI_OUT_MINUTES,
-            TAXI_IN_MINUTES,
-            FLIGHT_DISTANCE_MILES,
-            BLOCK_HOURS,
-            CANCELLED_FLAG,
-            DIVERTED_FLAG,
-            SOURCE_SYSTEM,
-            CREATED_TS,
-            UPDATED_TS
-        FROM lk
-    ) src
-    ON tgt.SCHEDULE_ID = src.SCHEDULE_ID
-       AND tgt.DATE_KEY = src.DATE_KEY
+            merge_key,
+            date_key,
+            airline_key,
+            aircraft_key,
+            route_key,
+            origin_airport_key,
+            destination_airport_key,
+            schedule_id,
+            scheduled_departure_ts,
+            actual_departure_ts,
+            scheduled_arrival_ts,
+            actual_arrival_ts,
+            delay_minutes,
+            taxi_out_minutes,
+            taxi_in_minutes,
+            flight_distance_miles,
+            block_hours,
+            cancelled_flag,
+            diverted_flag,
+            source_system,
+            dw_created_ts,
+            dw_updated_ts
+        FROM final
+    ) AS S
+    ON (
+        /* Match an existing row by schedule_id when available; else approximate by schedule_id NULL rows */
+        (T.schedule_id IS NOT NULL AND T.schedule_id = S.schedule_id)
+        OR
+        (T.schedule_id IS NULL AND S.schedule_id IS NULL
+         AND T.date_key = S.date_key
+         AND NVL(T.airline_key, -1) = NVL(S.airline_key, -1)
+         AND NVL(T.origin_airport_key, -1) = NVL(S.origin_airport_key, -1)
+         AND NVL(T.destination_airport_key, -1) = NVL(S.destination_airport_key, -1)
+         AND NVL(T.scheduled_departure_ts, '1900-01-01'::TIMESTAMP) = NVL(S.scheduled_departure_ts, '1900-01-01'::TIMESTAMP)
+        )
+    )
     WHEN MATCHED THEN UPDATE SET
-        tgt.DATE_KEY = src.DATE_KEY,
-        tgt.AIRLINE_KEY = src.AIRLINE_KEY,
-        tgt.AIRCRAFT_KEY = src.AIRCRAFT_KEY,
-        tgt.ROUTE_KEY = src.ROUTE_KEY,
-        tgt.ORIGIN_AIRPORT_KEY = src.ORIGIN_AIRPORT_KEY,
-        tgt.DESTINATION_AIRPORT_KEY = src.DESTINATION_AIRPORT_KEY,
-        tgt.SCHEDULED_DEPARTURE_TS = src.SCHEDULED_DEPARTURE_TS,
-        tgt.ACTUAL_DEPARTURE_TS = src.ACTUAL_DEPARTURE_TS,
-        tgt.SCHEDULED_ARRIVAL_TS = src.SCHEDULED_ARRIVAL_TS,
-        tgt.ACTUAL_ARRIVAL_TS = src.ACTUAL_ARRIVAL_TS,
-        tgt.DELAY_MINUTES = src.DELAY_MINUTES,
-        tgt.TAXI_OUT_MINUTES = src.TAXI_OUT_MINUTES,
-        tgt.TAXI_IN_MINUTES = src.TAXI_IN_MINUTES,
-        tgt.FLIGHT_DISTANCE_MILES = src.FLIGHT_DISTANCE_MILES,
-        tgt.BLOCK_HOURS = src.BLOCK_HOURS,
-        tgt.CANCELLED_FLAG = src.CANCELLED_FLAG,
-        tgt.DIVERTED_FLAG = src.DIVERTED_FLAG,
-        tgt.SOURCE_SYSTEM = src.SOURCE_SYSTEM,
-        tgt.DW_UPDATED_TS = CURRENT_TIMESTAMP()
+        T.date_key = S.date_key,
+        T.airline_key = S.airline_key,
+        T.aircraft_key = S.aircraft_key,
+        T.route_key = S.route_key,
+        T.origin_airport_key = S.origin_airport_key,
+        T.destination_airport_key = S.destination_airport_key,
+        T.schedule_id = S.schedule_id,
+        T.scheduled_departure_ts = S.scheduled_departure_ts,
+        T.actual_departure_ts = S.actual_departure_ts,
+        T.scheduled_arrival_ts = S.scheduled_arrival_ts,
+        T.actual_arrival_ts = S.actual_arrival_ts,
+        T.delay_minutes = S.delay_minutes,
+        T.taxi_out_minutes = S.taxi_out_minutes,
+        T.taxi_in_minutes = S.taxi_in_minutes,
+        T.flight_distance_miles = S.flight_distance_miles,
+        T.block_hours = S.block_hours,
+        T.cancelled_flag = S.cancelled_flag,
+        T.diverted_flag = S.diverted_flag,
+        T.source_system = S.source_system,
+        T.dw_updated_ts = CURRENT_TIMESTAMP()
     WHEN NOT MATCHED THEN INSERT (
-        DATE_KEY,
-        AIRLINE_KEY,
-        AIRCRAFT_KEY,
-        ROUTE_KEY,
-        ORIGIN_AIRPORT_KEY,
-        DESTINATION_AIRPORT_KEY,
-        SCHEDULE_ID,
-        SCHEDULED_DEPARTURE_TS,
-        ACTUAL_DEPARTURE_TS,
-        SCHEDULED_ARRIVAL_TS,
-        ACTUAL_ARRIVAL_TS,
-        DELAY_MINUTES,
-        TAXI_OUT_MINUTES,
-        TAXI_IN_MINUTES,
-        FLIGHT_DISTANCE_MILES,
-        BLOCK_HOURS,
-        CANCELLED_FLAG,
-        DIVERTED_FLAG,
-        SOURCE_SYSTEM,
-        DW_CREATED_TS,
-        DW_UPDATED_TS
+        date_key,
+        airline_key,
+        aircraft_key,
+        route_key,
+        origin_airport_key,
+        destination_airport_key,
+        schedule_id,
+        scheduled_departure_ts,
+        actual_departure_ts,
+        scheduled_arrival_ts,
+        actual_arrival_ts,
+        delay_minutes,
+        taxi_out_minutes,
+        taxi_in_minutes,
+        flight_distance_miles,
+        block_hours,
+        cancelled_flag,
+        diverted_flag,
+        source_system,
+        dw_created_ts,
+        dw_updated_ts
     ) VALUES (
-        src.DATE_KEY,
-        src.AIRLINE_KEY,
-        src.AIRCRAFT_KEY,
-        src.ROUTE_KEY,
-        src.ORIGIN_AIRPORT_KEY,
-        src.DESTINATION_AIRPORT_KEY,
-        src.SCHEDULE_ID,
-        src.SCHEDULED_DEPARTURE_TS,
-        src.ACTUAL_DEPARTURE_TS,
-        src.SCHEDULED_ARRIVAL_TS,
-        src.ACTUAL_ARRIVAL_TS,
-        src.DELAY_MINUTES,
-        src.TAXI_OUT_MINUTES,
-        src.TAXI_IN_MINUTES,
-        src.FLIGHT_DISTANCE_MILES,
-        src.BLOCK_HOURS,
-        src.CANCELLED_FLAG,
-        src.DIVERTED_FLAG,
-        src.SOURCE_SYSTEM,
+        S.date_key,
+        S.airline_key,
+        S.aircraft_key,
+        S.route_key,
+        S.origin_airport_key,
+        S.destination_airport_key,
+        S.schedule_id,
+        S.scheduled_departure_ts,
+        S.actual_departure_ts,
+        S.scheduled_arrival_ts,
+        S.actual_arrival_ts,
+        S.delay_minutes,
+        S.taxi_out_minutes,
+        S.taxi_in_minutes,
+        S.flight_distance_miles,
+        S.block_hours,
+        S.cancelled_flag,
+        S.diverted_flag,
+        S.source_system,
         CURRENT_TIMESTAMP(),
         CURRENT_TIMESTAMP()
     );
 
-    V_ROWS_AFFECTED := (SELECT COALESCE(SUM(rows_affected),0) FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())));
+    V_STATUS := 'SUCCESS';
+    V_END_TS := CURRENT_TIMESTAMP();
 
-    -- Post-step audit
     IF (UPPER(V_TARGET_TABLE) <> UPPER(P_AUDIT_TABLE_FQN)) THEN
         EXECUTE IMMEDIATE
-            'INSERT INTO ' || P_AUDIT_TABLE_FQN || ' (procedure_name, target_table, start_ts, end_ts, status, rows_affected) VALUES (?, ?, ?, ?, ?, ?)'
-            USING (V_PROC_NAME, V_TARGET_TABLE, V_START_TS, CURRENT_TIMESTAMP(), 'SUCCESS', V_ROWS_AFFECTED);
+            'INSERT INTO ' || P_AUDIT_TABLE_FQN || '
+             (procedure_name, target_table, start_ts, end_ts, status, rows_inserted, rows_updated)
+             SELECT ?, ?, ?, ?, ?, ?, ?'
+            USING (V_PROC_NAME, V_TARGET_TABLE, V_START_TS, V_END_TS, V_STATUS, V_MERGE_ROWS_INSERTED, V_MERGE_ROWS_UPDATED);
     END IF;
 
-    RETURN OBJECT_CONSTRUCT('status','SUCCESS','rows_affected',V_ROWS_AFFECTED);
+    RETURN 'SUCCESS';
 
 EXCEPTION
     WHEN OTHER THEN
+        V_STATUS := 'FAILED';
+        V_ERR_MSG := SQLERRM;
+        V_END_TS := CURRENT_TIMESTAMP();
+
         IF (UPPER(V_TARGET_TABLE) <> UPPER(P_AUDIT_TABLE_FQN)) THEN
             EXECUTE IMMEDIATE
-                'INSERT INTO ' || P_AUDIT_TABLE_FQN || ' (procedure_name, target_table, start_ts, end_ts, status, error_message) VALUES (?, ?, ?, ?, ?, ?)'
-                USING (V_PROC_NAME, V_TARGET_TABLE, V_START_TS, CURRENT_TIMESTAMP(), 'FAILED', SQLERRM);
+                'INSERT INTO ' || P_AUDIT_TABLE_FQN || '
+                 (procedure_name, target_table, start_ts, end_ts, status, error_message)
+                 SELECT ?, ?, ?, ?, ?, ?'
+                USING (V_PROC_NAME, V_TARGET_TABLE, V_START_TS, V_END_TS, V_STATUS, V_ERR_MSG);
         END IF;
-        RETURN OBJECT_CONSTRUCT('status','FAILED','error',SQLERRM);
+
+        RAISE;
 END;
 $$;
