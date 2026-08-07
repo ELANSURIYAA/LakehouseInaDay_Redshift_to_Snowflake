@@ -1,0 +1,5 @@
+-- NOTE: This file is a placeholder.
+-- The current environment does not provide a Snowflake execution/deployment tool,
+-- and additional procedures/metadata files are required by the task.
+-- Generate and deploy stored procedures for each Gold Fact table using Snowflake Scripting,
+-- including audit logging and MERGE logic per mapping.
