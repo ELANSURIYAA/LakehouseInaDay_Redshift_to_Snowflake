@@ -1,0 +1,28 @@
+Open Items / Manual Review Required
+
+1) Procedure generation + Snowflake deployment not executed in this run.
+   - The provided toolset only includes GitHub reader/writer; no Snowflake execution/deployment tool or connection details were provided.
+   - To complete stored procedure generation and deployment confirmation, provide Snowflake account/role/database/warehouse and an execution tool/connector.
+
+2) dim_date fiscal calendar convention is ambiguous.
+   - Mapping notes: "Confirm fiscal calendar convention with Finance" and FY starts April example.
+   - Requires explicit fiscal year start month and holiday calendar source.
+
+3) fact_aircraft_utilization ground_hours / available_hours derivation.
+   - Mapping describes ground_hours as residual/turnaround time and available_hours as 24 - utilization - maintenance - ground.
+   - Exact computation for ground_hours is not specified; needs clarified business rule.
+
+4) fact_flight_events.flight_key resolution.
+   - Mapping implies joining slv_flight_events.flight_id to fact_flight_operations via slv_flight_operations, but fact_flight_operations does not store flight_id.
+   - Requires explicit natural key strategy for flight operations fact (e.g., store flight_id in Gold, or match on (schedule_id, airline, date, airports, timestamps)).
+
+5) Append-only vs MERGE behavior for fact_flight_events.
+   - Mapping notes append-only, but also includes dw_updated_ts behavior.
+   - Need confirmation whether events can be re-sent/updated and whether dedupe key is event_id.
+
+6) fact_flight_history.flight_key lookup logic is underspecified.
+   - Mapping: match via carrier/route/date; but exact join fields are not defined and operational fact does not store carrier_code/route_id.
+
+7) Shared audit table name and schema.
+   - Requirements require audit logging into an existing shared audit table passed as parameter/session variable.
+   - Need the exact audit table DDL (column list) and required parameters.
